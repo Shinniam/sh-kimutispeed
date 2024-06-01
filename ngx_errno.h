@@ -13,64 +13,56 @@
 #include <ngx_core.h>
 
 
-typedef int               ngx_err_t;
+typedef DWORD                      ngx_err_t;
 
-#define NGX_EPERM         EPERM
-#define NGX_ENOENT        ENOENT
-#define NGX_ENOPATH       ENOENT
-#define NGX_ESRCH         ESRCH
-#define NGX_EINTR         EINTR
-#define NGX_ECHILD        ECHILD
-#define NGX_ENOMEM        ENOMEM
-#define NGX_EACCES        EACCES
-#define NGX_EBUSY         EBUSY
-#define NGX_EEXIST        EEXIST
-#define NGX_EEXIST_FILE   EEXIST
-#define NGX_EXDEV         EXDEV
-#define NGX_ENOTDIR       ENOTDIR
-#define NGX_EISDIR        EISDIR
-#define NGX_EINVAL        EINVAL
-#define NGX_ENFILE        ENFILE
-#define NGX_EMFILE        EMFILE
-#define NGX_ENOSPC        ENOSPC
-#define NGX_EPIPE         EPIPE
-#define NGX_EINPROGRESS   EINPROGRESS
-#define NGX_ENOPROTOOPT   ENOPROTOOPT
-#define NGX_EOPNOTSUPP    EOPNOTSUPP
-#define NGX_EADDRINUSE    EADDRINUSE
-#define NGX_ECONNABORTED  ECONNABORTED
-#define NGX_ECONNRESET    ECONNRESET
-#define NGX_ENOTCONN      ENOTCONN
-#define NGX_ETIMEDOUT     ETIMEDOUT
-#define NGX_ECONNREFUSED  ECONNREFUSED
-#define NGX_ENAMETOOLONG  ENAMETOOLONG
-#define NGX_ENETDOWN      ENETDOWN
-#define NGX_ENETUNREACH   ENETUNREACH
-#define NGX_EHOSTDOWN     EHOSTDOWN
-#define NGX_EHOSTUNREACH  EHOSTUNREACH
-#define NGX_ENOSYS        ENOSYS
-#define NGX_ECANCELED     ECANCELED
-#define NGX_EILSEQ        EILSEQ
-#define NGX_ENOMOREFILES  0
-#define NGX_ELOOP         ELOOP
-#define NGX_EBADF         EBADF
-#define NGX_EMSGSIZE      EMSGSIZE
+#define ngx_errno                  GetLastError()
+#define ngx_set_errno(err)         SetLastError(err)
+#define ngx_socket_errno           WSAGetLastError()
+#define ngx_set_socket_errno(err)  WSASetLastError(err)
 
-#if (NGX_HAVE_OPENAT)
-#define NGX_EMLINK        EMLINK
-#endif
+#define NGX_EPERM                  ERROR_ACCESS_DENIED
+#define NGX_ENOENT                 ERROR_FILE_NOT_FOUND
+#define NGX_ENOPATH                ERROR_PATH_NOT_FOUND
+#define NGX_ENOMEM                 ERROR_NOT_ENOUGH_MEMORY
+#define NGX_EACCES                 ERROR_ACCESS_DENIED
+/*
+ * there are two EEXIST error codes:
+ * ERROR_FILE_EXISTS used by CreateFile(CREATE_NEW),
+ * and ERROR_ALREADY_EXISTS used by CreateDirectory();
+ * MoveFile() uses both
+ */
+#define NGX_EEXIST                 ERROR_ALREADY_EXISTS
+#define NGX_EEXIST_FILE            ERROR_FILE_EXISTS
+#define NGX_EXDEV                  ERROR_NOT_SAME_DEVICE
+#define NGX_ENOTDIR                ERROR_PATH_NOT_FOUND
+#define NGX_EISDIR                 ERROR_CANNOT_MAKE
+#define NGX_ENOSPC                 ERROR_DISK_FULL
+#define NGX_EPIPE                  EPIPE
+#define NGX_EAGAIN                 WSAEWOULDBLOCK
+#define NGX_EINPROGRESS            WSAEINPROGRESS
+#define NGX_ENOPROTOOPT            WSAENOPROTOOPT
+#define NGX_EOPNOTSUPP             WSAEOPNOTSUPP
+#define NGX_EADDRINUSE             WSAEADDRINUSE
+#define NGX_ECONNABORTED           WSAECONNABORTED
+#define NGX_ECONNRESET             WSAECONNRESET
+#define NGX_ENOTCONN               WSAENOTCONN
+#define NGX_ETIMEDOUT              WSAETIMEDOUT
+#define NGX_ECONNREFUSED           WSAECONNREFUSED
+#define NGX_ENAMETOOLONG           ERROR_BAD_PATHNAME
+#define NGX_ENETDOWN               WSAENETDOWN
+#define NGX_ENETUNREACH            WSAENETUNREACH
+#define NGX_EHOSTDOWN              WSAEHOSTDOWN
+#define NGX_EHOSTUNREACH           WSAEHOSTUNREACH
+#define NGX_ENOMOREFILES           ERROR_NO_MORE_FILES
+#define NGX_EILSEQ                 ERROR_NO_UNICODE_TRANSLATION
+#define NGX_ELOOP                  0
+#define NGX_EBADF                  WSAEBADF
+#define NGX_EMSGSIZE               WSAEMSGSIZE
 
-#if (__hpux__)
-#define NGX_EAGAIN        EWOULDBLOCK
-#else
-#define NGX_EAGAIN        EAGAIN
-#endif
-
-
-#define ngx_errno                  errno
-#define ngx_socket_errno           errno
-#define ngx_set_errno(err)         errno = err
-#define ngx_set_socket_errno(err)  errno = err
+#define NGX_EALREADY               WSAEALREADY
+#define NGX_EINVAL                 WSAEINVAL
+#define NGX_EMFILE                 WSAEMFILE
+#define NGX_ENFILE                 WSAEMFILE
 
 
 u_char *ngx_strerror(ngx_err_t err, u_char *errstr, size_t size);

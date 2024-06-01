@@ -9,20 +9,14 @@
 #include <ngx_core.h>
 
 
-#if (NGX_HAVE_DLOPEN)
-
 char *
 ngx_dlerror(void)
 {
-    char  *err;
+    u_char         *p;
+    static u_char   errstr[NGX_MAX_ERROR_STR];
 
-    err = (char *) dlerror();
+    p = ngx_strerror(ngx_errno, errstr, NGX_MAX_ERROR_STR);
+    *p = '\0';
 
-    if (err == NULL) {
-        return "";
-    }
-
-    return err;
+    return (char *) errstr;
 }
-
-#endif

@@ -9,282 +9,89 @@
 #include <ngx_core.h>
 
 
-#if (NGX_THREADS)
-#include <ngx_thread_pool.h>
-static void ngx_thread_read_handler(void *data, ngx_log_t *log);
-static void ngx_thread_write_chain_to_file_handler(void *data, ngx_log_t *log);
-#endif
+#define NGX_UTF16_BUFLEN  256
+#define NGX_UTF8_BUFLEN   512
 
-static ngx_chain_t *ngx_chain_to_iovec(ngx_iovec_t *vec, ngx_chain_t *cl);
-static ssize_t ngx_writev_file(ngx_file_t *file, ngx_iovec_t *vec,
-    off_t offset);
-
-
-#if (NGX_HAVE_FILE_AIO)
-
-ngx_uint_t  ngx_file_aio = 1;
-
-#endif
+static ngx_int_t ngx_win32_check_filename(u_short *u, size_t len,
+    ngx_uint_t dirname);
+static u_short *ngx_utf8_to_utf16(u_short *utf16, u_char *utf8, size_t *len,
+    size_t reserved);
+static u_char *ngx_utf16_to_utf8(u_char *utf8, u_short *utf16, size_t *len,
+    size_t *allocated);
+uint32_t ngx_utf16_decode(u_short **u, size_t n);
 
 
-ssize_t
-ngx_read_file(ngx_file_t *file, u_char *buf, size_t size, off_t offset)
+/* FILE_FLAG_BACKUP_SEMANTICS allows to obtain a handle to a directory */
+
+ngx_fd_t
+ngx_open_file(u_char *name, u_long mode, u_long create, u_long access)
 {
-    ssize_t  n;
+    size_t      len;
+    u_short    *u;
+    ngx_fd_t    fd;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
 
-    ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
-                   "read: %d, %p, %uz, %O", file->fd, buf, size, offset);
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
 
-#if (NGX_HAVE_PREAD)
-
-    n = pread(file->fd, buf, size, offset);
-
-    if (n == -1) {
-        ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
-                      "pread() \"%s\" failed", file->name.data);
-        return NGX_ERROR;
+    if (u == NULL) {
+        return INVALID_HANDLE_VALUE;
     }
 
-#else
+    fd = INVALID_HANDLE_VALUE;
 
-    if (file->sys_offset != offset) {
-        if (lseek(file->fd, offset, SEEK_SET) == -1) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
-                          "lseek() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->sys_offset = offset;
+    if (create == NGX_FILE_OPEN
+        && ngx_win32_check_filename(u, len, 0) != NGX_OK)
+    {
+        goto failed;
     }
 
-    n = read(file->fd, buf, size);
+    fd = CreateFileW(u, mode,
+                     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                     NULL, create, FILE_FLAG_BACKUP_SEMANTICS, NULL);
 
-    if (n == -1) {
-        ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
-                      "read() \"%s\" failed", file->name.data);
-        return NGX_ERROR;
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
     }
 
-    file->sys_offset += n;
-
-#endif
-
-    file->offset += n;
-
-    return n;
-}
-
-
-#if (NGX_THREADS)
-
-typedef struct {
-    ngx_fd_t       fd;
-    ngx_uint_t     write;   /* unsigned  write:1; */
-
-    u_char        *buf;
-    size_t         size;
-    ngx_chain_t   *chain;
-    off_t          offset;
-
-    size_t         nbytes;
-    ngx_err_t      err;
-} ngx_thread_file_ctx_t;
-
-
-ssize_t
-ngx_thread_read(ngx_file_t *file, u_char *buf, size_t size, off_t offset,
-    ngx_pool_t *pool)
-{
-    ngx_thread_task_t      *task;
-    ngx_thread_file_ctx_t  *ctx;
-
-    ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
-                   "thread read: %d, %p, %uz, %O",
-                   file->fd, buf, size, offset);
-
-    task = file->thread_task;
-
-    if (task == NULL) {
-        task = ngx_thread_task_alloc(pool, sizeof(ngx_thread_file_ctx_t));
-        if (task == NULL) {
-            return NGX_ERROR;
-        }
-
-        task->event.log = file->log;
-
-        file->thread_task = task;
-    }
-
-    ctx = task->ctx;
-
-    if (task->event.complete) {
-        task->event.complete = 0;
-
-        if (ctx->write) {
-            ngx_log_error(NGX_LOG_ALERT, file->log, 0,
-                          "invalid thread call, read instead of write");
-            return NGX_ERROR;
-        }
-
-        if (ctx->err) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, ctx->err,
-                          "pread() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        return ctx->nbytes;
-    }
-
-    task->handler = ngx_thread_read_handler;
-
-    ctx->write = 0;
-
-    ctx->fd = file->fd;
-    ctx->buf = buf;
-    ctx->size = size;
-    ctx->offset = offset;
-
-    if (file->thread_handler(task, file) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    return NGX_AGAIN;
-}
-
-
-#if (NGX_HAVE_PREAD)
-
-static void
-ngx_thread_read_handler(void *data, ngx_log_t *log)
-{
-    ngx_thread_file_ctx_t *ctx = data;
-
-    ssize_t  n;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_CORE, log, 0, "thread read handler");
-
-    n = pread(ctx->fd, ctx->buf, ctx->size, ctx->offset);
-
-    if (n == -1) {
-        ctx->err = ngx_errno;
-
-    } else {
-        ctx->nbytes = n;
-        ctx->err = 0;
-    }
-
-#if 0
-    ngx_time_update();
-#endif
-
-    ngx_log_debug4(NGX_LOG_DEBUG_CORE, log, 0,
-                   "pread: %z (err: %d) of %uz @%O",
-                   n, ctx->err, ctx->size, ctx->offset);
-}
-
-#else
-
-#error pread() is required!
-
-#endif
-
-#endif /* NGX_THREADS */
-
-
-ssize_t
-ngx_write_file(ngx_file_t *file, u_char *buf, size_t size, off_t offset)
-{
-    ssize_t    n, written;
-    ngx_err_t  err;
-
-    ngx_log_debug4(NGX_LOG_DEBUG_CORE, file->log, 0,
-                   "write: %d, %p, %uz, %O", file->fd, buf, size, offset);
-
-    written = 0;
-
-#if (NGX_HAVE_PWRITE)
-
-    for ( ;; ) {
-        n = pwrite(file->fd, buf + written, size, offset);
-
-        if (n == -1) {
-            err = ngx_errno;
-
-            if (err == NGX_EINTR) {
-                ngx_log_debug0(NGX_LOG_DEBUG_CORE, file->log, err,
-                               "pwrite() was interrupted");
-                continue;
-            }
-
-            ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                          "pwrite() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->offset += n;
-        written += n;
-
-        if ((size_t) n == size) {
-            return written;
-        }
-
-        offset += n;
-        size -= n;
-    }
-
-#else
-
-    if (file->sys_offset != offset) {
-        if (lseek(file->fd, offset, SEEK_SET) == -1) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
-                          "lseek() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->sys_offset = offset;
-    }
-
-    for ( ;; ) {
-        n = write(file->fd, buf + written, size);
-
-        if (n == -1) {
-            err = ngx_errno;
-
-            if (err == NGX_EINTR) {
-                ngx_log_debug0(NGX_LOG_DEBUG_CORE, file->log, err,
-                               "write() was interrupted");
-                continue;
-            }
-
-            ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                          "write() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->sys_offset += n;
-        file->offset += n;
-        written += n;
-
-        if ((size_t) n == size) {
-            return written;
-        }
-
-        size -= n;
-    }
-#endif
+    return fd;
 }
 
 
 ngx_fd_t
 ngx_open_tempfile(u_char *name, ngx_uint_t persistent, ngx_uint_t access)
 {
-    ngx_fd_t  fd;
+    size_t      len;
+    u_short    *u;
+    ngx_fd_t    fd;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
 
-    fd = open((const char *) name, O_CREAT|O_EXCL|O_RDWR,
-              access ? access : 0600);
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
 
-    if (fd != -1 && !persistent) {
-        (void) unlink((const char *) name);
+    if (u == NULL) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    fd = CreateFileW(u,
+                     GENERIC_READ|GENERIC_WRITE,
+                     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                     NULL,
+                     CREATE_NEW,
+                     persistent ? 0:
+                         FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,
+                     NULL);
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
     }
 
     return fd;
@@ -292,180 +99,31 @@ ngx_open_tempfile(u_char *name, ngx_uint_t persistent, ngx_uint_t access)
 
 
 ssize_t
-ngx_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl, off_t offset,
-    ngx_pool_t *pool)
+ngx_read_file(ngx_file_t *file, u_char *buf, size_t size, off_t offset)
 {
-    ssize_t        total, n;
-    ngx_iovec_t    vec;
-    struct iovec   iovs[NGX_IOVS_PREALLOCATE];
+    u_long      n;
+    ngx_err_t   err;
+    OVERLAPPED  ovlp, *povlp;
 
-    /* use pwrite() if there is the only buf in a chain */
+    ovlp.Internal = 0;
+    ovlp.InternalHigh = 0;
+    ovlp.Offset = (u_long) offset;
+    ovlp.OffsetHigh = (u_long) (offset >> 32);
+    ovlp.hEvent = NULL;
 
-    if (cl->next == NULL) {
-        return ngx_write_file(file, cl->buf->pos,
-                              (size_t) (cl->buf->last - cl->buf->pos),
-                              offset);
-    }
+    povlp = &ovlp;
 
-    total = 0;
-
-    vec.iovs = iovs;
-    vec.nalloc = NGX_IOVS_PREALLOCATE;
-
-    do {
-        /* create the iovec and coalesce the neighbouring bufs */
-        cl = ngx_chain_to_iovec(&vec, cl);
-
-        /* use pwrite() if there is the only iovec buffer */
-
-        if (vec.count == 1) {
-            n = ngx_write_file(file, (u_char *) iovs[0].iov_base,
-                               iovs[0].iov_len, offset);
-
-            if (n == NGX_ERROR) {
-                return n;
-            }
-
-            return total + n;
-        }
-
-        n = ngx_writev_file(file, &vec, offset);
-
-        if (n == NGX_ERROR) {
-            return n;
-        }
-
-        offset += n;
-        total += n;
-
-    } while (cl);
-
-    return total;
-}
-
-
-static ngx_chain_t *
-ngx_chain_to_iovec(ngx_iovec_t *vec, ngx_chain_t *cl)
-{
-    size_t         total, size;
-    u_char        *prev;
-    ngx_uint_t     n;
-    struct iovec  *iov;
-
-    iov = NULL;
-    prev = NULL;
-    total = 0;
-    n = 0;
-
-    for ( /* void */ ; cl; cl = cl->next) {
-
-        if (ngx_buf_special(cl->buf)) {
-            continue;
-        }
-
-        size = cl->buf->last - cl->buf->pos;
-
-        if (prev == cl->buf->pos) {
-            iov->iov_len += size;
-
-        } else {
-            if (n == vec->nalloc) {
-                break;
-            }
-
-            iov = &vec->iovs[n++];
-
-            iov->iov_base = (void *) cl->buf->pos;
-            iov->iov_len = size;
-        }
-
-        prev = cl->buf->pos + size;
-        total += size;
-    }
-
-    vec->count = n;
-    vec->size = total;
-
-    return cl;
-}
-
-
-static ssize_t
-ngx_writev_file(ngx_file_t *file, ngx_iovec_t *vec, off_t offset)
-{
-    ssize_t    n;
-    ngx_err_t  err;
-
-    ngx_log_debug3(NGX_LOG_DEBUG_CORE, file->log, 0,
-                   "writev: %d, %uz, %O", file->fd, vec->size, offset);
-
-#if (NGX_HAVE_PWRITEV)
-
-eintr:
-
-    n = pwritev(file->fd, vec->iovs, vec->count, offset);
-
-    if (n == -1) {
+    if (ReadFile(file->fd, buf, size, &n, povlp) == 0) {
         err = ngx_errno;
 
-        if (err == NGX_EINTR) {
-            ngx_log_debug0(NGX_LOG_DEBUG_CORE, file->log, err,
-                           "pwritev() was interrupted");
-            goto eintr;
+        if (err == ERROR_HANDLE_EOF) {
+            return 0;
         }
 
-        ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                      "pwritev() \"%s\" failed", file->name.data);
+        ngx_log_error(NGX_LOG_ERR, file->log, err,
+                      "ReadFile() \"%s\" failed", file->name.data);
         return NGX_ERROR;
     }
-
-    if ((size_t) n != vec->size) {
-        ngx_log_error(NGX_LOG_CRIT, file->log, 0,
-                      "pwritev() \"%s\" has written only %z of %uz",
-                      file->name.data, n, vec->size);
-        return NGX_ERROR;
-    }
-
-#else
-
-    if (file->sys_offset != offset) {
-        if (lseek(file->fd, offset, SEEK_SET) == -1) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, ngx_errno,
-                          "lseek() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->sys_offset = offset;
-    }
-
-eintr:
-
-    n = writev(file->fd, vec->iovs, vec->count);
-
-    if (n == -1) {
-        err = ngx_errno;
-
-        if (err == NGX_EINTR) {
-            ngx_log_debug0(NGX_LOG_DEBUG_CORE, file->log, err,
-                           "writev() was interrupted");
-            goto eintr;
-        }
-
-        ngx_log_error(NGX_LOG_CRIT, file->log, err,
-                      "writev() \"%s\" failed", file->name.data);
-        return NGX_ERROR;
-    }
-
-    if ((size_t) n != vec->size) {
-        ngx_log_error(NGX_LOG_CRIT, file->log, 0,
-                      "writev() \"%s\" has written only %z of %uz",
-                      file->name.data, n, vec->size);
-        return NGX_ERROR;
-    }
-
-    file->sys_offset += n;
-
-#endif
 
     file->offset += n;
 
@@ -473,145 +131,330 @@ eintr:
 }
 
 
-#if (NGX_THREADS)
-
 ssize_t
-ngx_thread_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl, off_t offset,
-    ngx_pool_t *pool)
+ngx_write_file(ngx_file_t *file, u_char *buf, size_t size, off_t offset)
 {
-    ngx_thread_task_t      *task;
-    ngx_thread_file_ctx_t  *ctx;
+    u_long      n;
+    OVERLAPPED  ovlp, *povlp;
 
-    ngx_log_debug3(NGX_LOG_DEBUG_CORE, file->log, 0,
-                   "thread write chain: %d, %p, %O",
-                   file->fd, cl, offset);
+    ovlp.Internal = 0;
+    ovlp.InternalHigh = 0;
+    ovlp.Offset = (u_long) offset;
+    ovlp.OffsetHigh = (u_long) (offset >> 32);
+    ovlp.hEvent = NULL;
 
-    task = file->thread_task;
+    povlp = &ovlp;
 
-    if (task == NULL) {
-        task = ngx_thread_task_alloc(pool,
-                                     sizeof(ngx_thread_file_ctx_t));
-        if (task == NULL) {
-            return NGX_ERROR;
-        }
-
-        task->event.log = file->log;
-
-        file->thread_task = task;
-    }
-
-    ctx = task->ctx;
-
-    if (task->event.complete) {
-        task->event.complete = 0;
-
-        if (!ctx->write) {
-            ngx_log_error(NGX_LOG_ALERT, file->log, 0,
-                          "invalid thread call, write instead of read");
-            return NGX_ERROR;
-        }
-
-        if (ctx->err || ctx->nbytes == 0) {
-            ngx_log_error(NGX_LOG_CRIT, file->log, ctx->err,
-                          "pwritev() \"%s\" failed", file->name.data);
-            return NGX_ERROR;
-        }
-
-        file->offset += ctx->nbytes;
-        return ctx->nbytes;
-    }
-
-    task->handler = ngx_thread_write_chain_to_file_handler;
-
-    ctx->write = 1;
-
-    ctx->fd = file->fd;
-    ctx->chain = cl;
-    ctx->offset = offset;
-
-    if (file->thread_handler(task, file) != NGX_OK) {
+    if (WriteFile(file->fd, buf, size, &n, povlp) == 0) {
+        ngx_log_error(NGX_LOG_ERR, file->log, ngx_errno,
+                      "WriteFile() \"%s\" failed", file->name.data);
         return NGX_ERROR;
     }
 
-    return NGX_AGAIN;
+    if (n != size) {
+        ngx_log_error(NGX_LOG_CRIT, file->log, 0,
+                      "WriteFile() \"%s\" has written only %ul of %uz",
+                      file->name.data, n, size);
+        return NGX_ERROR;
+    }
+
+    file->offset += n;
+
+    return n;
 }
 
 
-static void
-ngx_thread_write_chain_to_file_handler(void *data, ngx_log_t *log)
+ssize_t
+ngx_write_chain_to_file(ngx_file_t *file, ngx_chain_t *cl, off_t offset,
+    ngx_pool_t *pool)
 {
-    ngx_thread_file_ctx_t *ctx = data;
+    u_char   *buf, *prev;
+    size_t    size;
+    ssize_t   total, n;
 
-#if (NGX_HAVE_PWRITEV)
+    total = 0;
 
-    off_t          offset;
-    ssize_t        n;
-    ngx_err_t      err;
-    ngx_chain_t   *cl;
-    ngx_iovec_t    vec;
-    struct iovec   iovs[NGX_IOVS_PREALLOCATE];
+    while (cl) {
+        buf = cl->buf->pos;
+        prev = buf;
+        size = 0;
 
-    vec.iovs = iovs;
-    vec.nalloc = NGX_IOVS_PREALLOCATE;
+        /* coalesce the neighbouring bufs */
 
-    cl = ctx->chain;
-    offset = ctx->offset;
-
-    ctx->nbytes = 0;
-    ctx->err = 0;
-
-    do {
-        /* create the iovec and coalesce the neighbouring bufs */
-        cl = ngx_chain_to_iovec(&vec, cl);
-
-eintr:
-
-        n = pwritev(ctx->fd, iovs, vec.count, offset);
-
-        if (n == -1) {
-            err = ngx_errno;
-
-            if (err == NGX_EINTR) {
-                ngx_log_debug0(NGX_LOG_DEBUG_CORE, log, err,
-                               "pwritev() was interrupted");
-                goto eintr;
-            }
-
-            ctx->err = err;
-            return;
+        while (cl && prev == cl->buf->pos) {
+            size += cl->buf->last - cl->buf->pos;
+            prev = cl->buf->last;
+            cl = cl->next;
         }
 
-        if ((size_t) n != vec.size) {
-            ctx->nbytes = 0;
-            return;
+        n = ngx_write_file(file, buf, size, offset);
+
+        if (n == NGX_ERROR) {
+            return NGX_ERROR;
         }
 
-        ctx->nbytes += n;
+        total += n;
         offset += n;
-    } while (cl);
+    }
 
-#else
-
-    ctx->err = NGX_ENOSYS;
-    return;
-
-#endif
+    return total;
 }
 
-#endif /* NGX_THREADS */
+
+ssize_t
+ngx_read_fd(ngx_fd_t fd, void *buf, size_t size)
+{
+    u_long  n;
+
+    if (ReadFile(fd, buf, size, &n, NULL) != 0) {
+        return (size_t) n;
+    }
+
+    return -1;
+}
+
+
+ssize_t
+ngx_write_fd(ngx_fd_t fd, void *buf, size_t size)
+{
+    u_long  n;
+
+    if (WriteFile(fd, buf, size, &n, NULL) != 0) {
+        return (size_t) n;
+    }
+
+    return -1;
+}
+
+
+ssize_t
+ngx_write_console(ngx_fd_t fd, void *buf, size_t size)
+{
+    u_long  n;
+
+    (void) CharToOemBuff(buf, buf, size);
+
+    if (WriteFile(fd, buf, size, &n, NULL) != 0) {
+        return (size_t) n;
+    }
+
+    return -1;
+}
+
+
+ngx_int_t
+ngx_delete_file(u_char *name)
+{
+    long        rc;
+    size_t      len;
+    u_short    *u;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
+
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
+
+    if (u == NULL) {
+        return NGX_FILE_ERROR;
+    }
+
+    rc = NGX_FILE_ERROR;
+
+    if (ngx_win32_check_filename(u, len, 0) != NGX_OK) {
+        goto failed;
+    }
+
+    rc = DeleteFileW(u);
+
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    return rc;
+}
+
+
+ngx_int_t
+ngx_rename_file(u_char *from, u_char *to)
+{
+    long        rc;
+    size_t      len;
+    u_short    *fu, *tu;
+    ngx_err_t   err;
+    u_short     utf16f[NGX_UTF16_BUFLEN];
+    u_short     utf16t[NGX_UTF16_BUFLEN];
+
+    len = NGX_UTF16_BUFLEN;
+    fu = ngx_utf8_to_utf16(utf16f, from, &len, 0);
+
+    if (fu == NULL) {
+        return NGX_FILE_ERROR;
+    }
+
+    rc = NGX_FILE_ERROR;
+    tu = NULL;
+
+    if (ngx_win32_check_filename(fu, len, 0) != NGX_OK) {
+        goto failed;
+    }
+
+    len = NGX_UTF16_BUFLEN;
+    tu = ngx_utf8_to_utf16(utf16t, to, &len, 0);
+
+    if (tu == NULL) {
+        goto failed;
+    }
+
+    if (ngx_win32_check_filename(tu, len, 1) != NGX_OK) {
+        goto failed;
+    }
+
+    rc = MoveFileW(fu, tu);
+
+failed:
+
+    if (fu != utf16f) {
+        err = ngx_errno;
+        ngx_free(fu);
+        ngx_set_errno(err);
+    }
+
+    if (tu && tu != utf16t) {
+        err = ngx_errno;
+        ngx_free(tu);
+        ngx_set_errno(err);
+    }
+
+    return rc;
+}
+
+
+ngx_err_t
+ngx_win32_rename_file(ngx_str_t *from, ngx_str_t *to, ngx_log_t *log)
+{
+    u_char             *name;
+    ngx_err_t           err;
+    ngx_uint_t          collision;
+    ngx_atomic_uint_t   num;
+
+    name = ngx_alloc(to->len + 1 + NGX_ATOMIC_T_LEN + 1 + sizeof("DELETE"),
+                     log);
+    if (name == NULL) {
+        return NGX_ENOMEM;
+    }
+
+    ngx_memcpy(name, to->data, to->len);
+
+    collision = 0;
+
+    /* mutex_lock() (per cache or single ?) */
+
+    for ( ;; ) {
+        num = ngx_next_temp_number(collision);
+
+        ngx_sprintf(name + to->len, ".%0muA.DELETE%Z", num);
+
+        if (ngx_rename_file(to->data, name) != NGX_FILE_ERROR) {
+            break;
+        }
+
+        err = ngx_errno;
+
+        if (err == NGX_EEXIST || err == NGX_EEXIST_FILE) {
+            collision = 1;
+            continue;
+        }
+
+        ngx_log_error(NGX_LOG_CRIT, log, err,
+                      "MoveFile() \"%s\" to \"%s\" failed", to->data, name);
+        goto failed;
+    }
+
+    if (ngx_rename_file(from->data, to->data) == NGX_FILE_ERROR) {
+        err = ngx_errno;
+
+    } else {
+        err = 0;
+    }
+
+    if (ngx_delete_file(name) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                      "DeleteFile() \"%s\" failed", name);
+    }
+
+failed:
+
+    /* mutex_unlock() */
+
+    ngx_free(name);
+
+    return err;
+}
+
+
+ngx_int_t
+ngx_file_info(u_char *file, ngx_file_info_t *sb)
+{
+    size_t                      len;
+    long                        rc;
+    u_short                    *u;
+    ngx_err_t                   err;
+    WIN32_FILE_ATTRIBUTE_DATA   fa;
+    u_short                     utf16[NGX_UTF16_BUFLEN];
+
+    len = NGX_UTF16_BUFLEN;
+
+    u = ngx_utf8_to_utf16(utf16, file, &len, 0);
+
+    if (u == NULL) {
+        return NGX_FILE_ERROR;
+    }
+
+    rc = NGX_FILE_ERROR;
+
+    if (ngx_win32_check_filename(u, len, 0) != NGX_OK) {
+        goto failed;
+    }
+
+    rc = GetFileAttributesExW(u, GetFileExInfoStandard, &fa);
+
+    sb->dwFileAttributes = fa.dwFileAttributes;
+    sb->ftCreationTime = fa.ftCreationTime;
+    sb->ftLastAccessTime = fa.ftLastAccessTime;
+    sb->ftLastWriteTime = fa.ftLastWriteTime;
+    sb->nFileSizeHigh = fa.nFileSizeHigh;
+    sb->nFileSizeLow = fa.nFileSizeLow;
+
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    return rc;
+}
 
 
 ngx_int_t
 ngx_set_file_time(u_char *name, ngx_fd_t fd, time_t s)
 {
-    struct timeval  tv[2];
+    uint64_t  intervals;
+    FILETIME  ft;
 
-    tv[0].tv_sec = ngx_time();
-    tv[0].tv_usec = 0;
-    tv[1].tv_sec = s;
-    tv[1].tv_usec = 0;
+    /* 116444736000000000 is commented in src/os/win32/ngx_time.c */
 
-    if (utimes((char *) name, tv) != -1) {
+    intervals = s * 10000000 + 116444736000000000;
+
+    ft.dwLowDateTime = (DWORD) intervals;
+    ft.dwHighDateTime = (DWORD) (intervals >> 32);
+
+    if (SetFileTime(fd, NULL, NULL, &ft) != 0) {
         return NGX_OK;
     }
 
@@ -622,6 +465,8 @@ ngx_set_file_time(u_char *name, ngx_fd_t fd, time_t s)
 ngx_int_t
 ngx_create_file_mapping(ngx_file_mapping_t *fm)
 {
+    LARGE_INTEGER  size;
+
     fm->fd = ngx_open_file(fm->name, NGX_FILE_RDWR, NGX_FILE_TRUNCATE,
                            NGX_FILE_DEFAULT_ACCESS);
 
@@ -631,22 +476,53 @@ ngx_create_file_mapping(ngx_file_mapping_t *fm)
         return NGX_ERROR;
     }
 
-    if (ftruncate(fm->fd, fm->size) == -1) {
+    fm->handle = NULL;
+
+    size.QuadPart = fm->size;
+
+    if (SetFilePointerEx(fm->fd, size, NULL, FILE_BEGIN) == 0) {
         ngx_log_error(NGX_LOG_CRIT, fm->log, ngx_errno,
-                      "ftruncate() \"%s\" failed", fm->name);
+                      "SetFilePointerEx(\"%s\", %uz) failed",
+                      fm->name, fm->size);
         goto failed;
     }
 
-    fm->addr = mmap(NULL, fm->size, PROT_READ|PROT_WRITE, MAP_SHARED,
-                    fm->fd, 0);
-    if (fm->addr != MAP_FAILED) {
+    if (SetEndOfFile(fm->fd) == 0) {
+        ngx_log_error(NGX_LOG_CRIT, fm->log, ngx_errno,
+                      "SetEndOfFile() \"%s\" failed", fm->name);
+        goto failed;
+    }
+
+    fm->handle = CreateFileMapping(fm->fd, NULL, PAGE_READWRITE,
+                                   (u_long) ((off_t) fm->size >> 32),
+                                   (u_long) ((off_t) fm->size & 0xffffffff),
+                                   NULL);
+    if (fm->handle == NULL) {
+        ngx_log_error(NGX_LOG_CRIT, fm->log, ngx_errno,
+                      "CreateFileMapping(%s, %uz) failed",
+                      fm->name, fm->size);
+        goto failed;
+    }
+
+    fm->addr = MapViewOfFile(fm->handle, FILE_MAP_WRITE, 0, 0, 0);
+
+    if (fm->addr != NULL) {
         return NGX_OK;
     }
 
     ngx_log_error(NGX_LOG_CRIT, fm->log, ngx_errno,
-                  "mmap(%uz) \"%s\" failed", fm->size, fm->name);
+                  "MapViewOfFile(%uz) of file mapping \"%s\" failed",
+                  fm->size, fm->name);
 
 failed:
+
+    if (fm->handle) {
+        if (CloseHandle(fm->handle) == 0) {
+            ngx_log_error(NGX_LOG_ALERT, fm->log, ngx_errno,
+                          "CloseHandle() of file mapping \"%s\" failed",
+                          fm->name);
+        }
+    }
 
     if (ngx_close_file(fm->fd) == NGX_FILE_ERROR) {
         ngx_log_error(NGX_LOG_ALERT, fm->log, ngx_errno,
@@ -660,9 +536,16 @@ failed:
 void
 ngx_close_file_mapping(ngx_file_mapping_t *fm)
 {
-    if (munmap(fm->addr, fm->size) == -1) {
-        ngx_log_error(NGX_LOG_CRIT, fm->log, ngx_errno,
-                      "munmap(%uz) \"%s\" failed", fm->size, fm->name);
+    if (UnmapViewOfFile(fm->addr) == 0) {
+        ngx_log_error(NGX_LOG_ALERT, fm->log, ngx_errno,
+                      "UnmapViewOfFile(%p) of file mapping \"%s\" failed",
+                      fm->addr, &fm->name);
+    }
+
+    if (CloseHandle(fm->handle) == 0) {
+        ngx_log_error(NGX_LOG_ALERT, fm->log, ngx_errno,
+                      "CloseHandle() of file mapping \"%s\" failed",
+                      &fm->name);
     }
 
     if (ngx_close_file(fm->fd) == NGX_FILE_ERROR) {
@@ -672,285 +555,905 @@ ngx_close_file_mapping(ngx_file_mapping_t *fm)
 }
 
 
+u_char *
+ngx_realpath(u_char *path, u_char *resolved)
+{
+    /* STUB */
+    return path;
+}
+
+
+size_t
+ngx_getcwd(u_char *buf, size_t size)
+{
+    u_char   *p;
+    size_t    n;
+    u_short   utf16[NGX_MAX_PATH];
+
+    n = GetCurrentDirectoryW(NGX_MAX_PATH, utf16);
+
+    if (n == 0) {
+        return 0;
+    }
+
+    if (n > NGX_MAX_PATH) {
+        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+
+    p = ngx_utf16_to_utf8(buf, utf16, &size, NULL);
+
+    if (p == NULL) {
+        return 0;
+    }
+
+    if (p != buf) {
+        ngx_free(p);
+        ngx_set_errno(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+
+    return size - 1;
+}
+
+
 ngx_int_t
 ngx_open_dir(ngx_str_t *name, ngx_dir_t *dir)
 {
-    dir->dir = opendir((const char *) name->data);
+    size_t      len;
+    u_short    *u, *p;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
 
-    if (dir->dir == NULL) {
+    len = NGX_UTF16_BUFLEN - 2;
+    u = ngx_utf8_to_utf16(utf16, name->data, &len, 2);
+
+    if (u == NULL) {
         return NGX_ERROR;
     }
 
-    dir->valid_info = 0;
+    if (ngx_win32_check_filename(u, len, 0) != NGX_OK) {
+        goto failed;
+    }
+
+    p = &u[len - 1];
+
+    *p++ = '/';
+    *p++ = '*';
+    *p = '\0';
+
+    dir->dir = FindFirstFileW(u, &dir->finddata);
+
+    if (dir->dir == INVALID_HANDLE_VALUE) {
+        goto failed;
+    }
+
+    if (u != utf16) {
+        ngx_free(u);
+    }
+
+    dir->valid_info = 1;
+    dir->ready = 1;
+    dir->name = NULL;
+    dir->allocated = 0;
 
     return NGX_OK;
+
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    return NGX_ERROR;
 }
 
 
 ngx_int_t
 ngx_read_dir(ngx_dir_t *dir)
 {
-    dir->de = readdir(dir->dir);
+    u_char  *name;
+    size_t   len, allocated;
 
-    if (dir->de) {
-#if (NGX_HAVE_D_TYPE)
-        dir->type = dir->de->d_type;
-#else
-        dir->type = 0;
-#endif
-        return NGX_OK;
+    if (dir->ready) {
+        dir->ready = 0;
+        goto convert;
+    }
+
+    if (FindNextFileW(dir->dir, &dir->finddata) != 0) {
+        dir->type = 1;
+        goto convert;
     }
 
     return NGX_ERROR;
+
+convert:
+
+    name = dir->name;
+    len = dir->allocated;
+
+    name = ngx_utf16_to_utf8(name, dir->finddata.cFileName, &len, &allocated);
+
+    if (name == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (name != dir->name) {
+
+        if (dir->name) {
+            ngx_free(dir->name);
+        }
+
+        dir->name = name;
+        dir->allocated = allocated;
+    }
+
+    dir->namelen = len - 1;
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_close_dir(ngx_dir_t *dir)
+{
+    if (dir->name) {
+        ngx_free(dir->name);
+    }
+
+    if (FindClose(dir->dir) == 0) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_create_dir(u_char *name, ngx_uint_t access)
+{
+    long        rc;
+    size_t      len;
+    u_short    *u;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
+
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
+
+    if (u == NULL) {
+        return NGX_FILE_ERROR;
+    }
+
+    rc = NGX_FILE_ERROR;
+
+    if (ngx_win32_check_filename(u, len, 1) != NGX_OK) {
+        goto failed;
+    }
+
+    rc = CreateDirectoryW(u, NULL);
+
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    return rc;
+}
+
+
+ngx_int_t
+ngx_delete_dir(u_char *name)
+{
+    long        rc;
+    size_t      len;
+    u_short    *u;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
+
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
+
+    if (u == NULL) {
+        return NGX_FILE_ERROR;
+    }
+
+    rc = NGX_FILE_ERROR;
+
+    if (ngx_win32_check_filename(u, len, 0) != NGX_OK) {
+        goto failed;
+    }
+
+    rc = RemoveDirectoryW(u);
+
+failed:
+
+    if (u != utf16) {
+        err = ngx_errno;
+        ngx_free(u);
+        ngx_set_errno(err);
+    }
+
+    return rc;
 }
 
 
 ngx_int_t
 ngx_open_glob(ngx_glob_t *gl)
 {
-    int  n;
+    u_char     *p;
+    size_t      len;
+    u_short    *u;
+    ngx_err_t   err;
+    u_short     utf16[NGX_UTF16_BUFLEN];
 
-    n = glob((char *) gl->pattern, 0, NULL, &gl->pglob);
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, gl->pattern, &len, 0);
 
-    if (n == 0) {
-        return NGX_OK;
+    if (u == NULL) {
+        return NGX_ERROR;
     }
 
-#ifdef GLOB_NOMATCH
+    gl->dir = FindFirstFileW(u, &gl->finddata);
 
-    if (n == GLOB_NOMATCH && gl->test) {
-        return NGX_OK;
+    if (gl->dir == INVALID_HANDLE_VALUE) {
+
+        err = ngx_errno;
+
+        if (u != utf16) {
+            ngx_free(u);
+        }
+
+        if ((err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+             && gl->test)
+        {
+            gl->no_match = 1;
+            return NGX_OK;
+        }
+
+        ngx_set_errno(err);
+
+        return NGX_ERROR;
     }
 
-#endif
+    for (p = gl->pattern; *p; p++) {
+        if (*p == '/') {
+            gl->last = p + 1 - gl->pattern;
+        }
+    }
 
-    return NGX_ERROR;
+    if (u != utf16) {
+        ngx_free(u);
+    }
+
+    gl->ready = 1;
+
+    return NGX_OK;
 }
 
 
 ngx_int_t
 ngx_read_glob(ngx_glob_t *gl, ngx_str_t *name)
 {
-    size_t  count;
+    u_char     *p;
+    size_t      len;
+    ngx_err_t   err;
+    u_char      utf8[NGX_UTF8_BUFLEN];
 
-#ifdef GLOB_NOMATCH
-    count = (size_t) gl->pglob.gl_pathc;
-#else
-    count = (size_t) gl->pglob.gl_matchc;
-#endif
-
-    if (gl->n < count) {
-
-        name->len = (size_t) ngx_strlen(gl->pglob.gl_pathv[gl->n]);
-        name->data = (u_char *) gl->pglob.gl_pathv[gl->n];
-        gl->n++;
-
-        return NGX_OK;
+    if (gl->no_match) {
+        return NGX_DONE;
     }
 
-    return NGX_DONE;
+    if (gl->ready) {
+        gl->ready = 0;
+        goto convert;
+    }
+
+    ngx_free(gl->name.data);
+    gl->name.data = NULL;
+
+    if (FindNextFileW(gl->dir, &gl->finddata) != 0) {
+        goto convert;
+    }
+
+    err = ngx_errno;
+
+    if (err == NGX_ENOMOREFILES) {
+        return NGX_DONE;
+    }
+
+    ngx_log_error(NGX_LOG_ALERT, gl->log, err,
+                  "FindNextFile(%s) failed", gl->pattern);
+
+    return NGX_ERROR;
+
+convert:
+
+    len = NGX_UTF8_BUFLEN;
+    p = ngx_utf16_to_utf8(utf8, gl->finddata.cFileName, &len, NULL);
+
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    gl->name.len = gl->last + len - 1;
+
+    gl->name.data = ngx_alloc(gl->name.len + 1, gl->log);
+    if (gl->name.data == NULL) {
+        goto failed;
+    }
+
+    ngx_memcpy(gl->name.data, gl->pattern, gl->last);
+    ngx_cpystrn(gl->name.data + gl->last, p, len);
+
+    if (p != utf8) {
+        ngx_free(p);
+    }
+
+    *name = gl->name;
+
+    return NGX_OK;
+
+failed:
+
+    if (p != utf8) {
+        err = ngx_errno;
+        ngx_free(p);
+        ngx_set_errno(err);
+    }
+
+    return NGX_ERROR;
 }
 
 
 void
 ngx_close_glob(ngx_glob_t *gl)
 {
-    globfree(&gl->pglob);
-}
-
-
-ngx_err_t
-ngx_trylock_fd(ngx_fd_t fd)
-{
-    struct flock  fl;
-
-    ngx_memzero(&fl, sizeof(struct flock));
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        return ngx_errno;
+    if (gl->name.data) {
+        ngx_free(gl->name.data);
     }
 
-    return 0;
-}
-
-
-ngx_err_t
-ngx_lock_fd(ngx_fd_t fd)
-{
-    struct flock  fl;
-
-    ngx_memzero(&fl, sizeof(struct flock));
-    fl.l_type = F_WRLCK;
-    fl.l_whence = SEEK_SET;
-
-    if (fcntl(fd, F_SETLKW, &fl) == -1) {
-        return ngx_errno;
+    if (gl->dir == INVALID_HANDLE_VALUE) {
+        return;
     }
 
-    return 0;
-}
-
-
-ngx_err_t
-ngx_unlock_fd(ngx_fd_t fd)
-{
-    struct flock  fl;
-
-    ngx_memzero(&fl, sizeof(struct flock));
-    fl.l_type = F_UNLCK;
-    fl.l_whence = SEEK_SET;
-
-    if (fcntl(fd, F_SETLK, &fl) == -1) {
-        return  ngx_errno;
+    if (FindClose(gl->dir) == 0) {
+        ngx_log_error(NGX_LOG_ALERT, gl->log, ngx_errno,
+                      "FindClose(%s) failed", gl->pattern);
     }
-
-    return 0;
 }
 
 
-#if (NGX_HAVE_POSIX_FADVISE) && !(NGX_HAVE_F_READAHEAD)
+ngx_int_t
+ngx_de_info(u_char *name, ngx_dir_t *dir)
+{
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_de_link_info(u_char *name, ngx_dir_t *dir)
+{
+    return NGX_OK;
+}
+
 
 ngx_int_t
 ngx_read_ahead(ngx_fd_t fd, size_t n)
 {
-    int  err;
-
-    err = posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-
-    if (err == 0) {
-        return 0;
-    }
-
-    ngx_set_errno(err);
-    return NGX_FILE_ERROR;
+    return ~NGX_FILE_ERROR;
 }
 
-#endif
-
-
-#if (NGX_HAVE_O_DIRECT)
 
 ngx_int_t
 ngx_directio_on(ngx_fd_t fd)
 {
-    int  flags;
-
-    flags = fcntl(fd, F_GETFL);
-
-    if (flags == -1) {
-        return NGX_FILE_ERROR;
-    }
-
-    return fcntl(fd, F_SETFL, flags | O_DIRECT);
+    return ~NGX_FILE_ERROR;
 }
 
 
 ngx_int_t
 ngx_directio_off(ngx_fd_t fd)
 {
-    int  flags;
-
-    flags = fcntl(fd, F_GETFL);
-
-    if (flags == -1) {
-        return NGX_FILE_ERROR;
-    }
-
-    return fcntl(fd, F_SETFL, flags & ~O_DIRECT);
+    return ~NGX_FILE_ERROR;
 }
 
-#endif
-
-
-#if (NGX_HAVE_STATFS)
 
 size_t
 ngx_fs_bsize(u_char *name)
 {
-    struct statfs  fs;
+    u_long    sc, bs, nfree, ncl;
+    size_t    len;
+    u_short  *u;
+    u_short   utf16[NGX_UTF16_BUFLEN];
 
-    if (statfs((char *) name, &fs) == -1) {
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
+
+    if (u == NULL) {
         return 512;
     }
 
-    if ((fs.f_bsize % 512) != 0) {
+    if (GetDiskFreeSpaceW(u, &sc, &bs, &nfree, &ncl) == 0) {
+
+        if (u != utf16) {
+            ngx_free(u);
+        }
+
         return 512;
     }
 
-#if (NGX_LINUX)
-    if ((size_t) fs.f_bsize > ngx_pagesize) {
-        return 512;
+    if (u != utf16) {
+        ngx_free(u);
     }
-#endif
 
-    return (size_t) fs.f_bsize;
+    return sc * bs;
 }
 
 
 off_t
 ngx_fs_available(u_char *name)
 {
-    struct statfs  fs;
+    size_t           len;
+    u_short         *u;
+    ULARGE_INTEGER   navail;
+    u_short          utf16[NGX_UTF16_BUFLEN];
 
-    if (statfs((char *) name, &fs) == -1) {
+    len = NGX_UTF16_BUFLEN;
+    u = ngx_utf8_to_utf16(utf16, name, &len, 0);
+
+    if (u == NULL) {
         return NGX_MAX_OFF_T_VALUE;
     }
 
-    return (off_t) fs.f_bavail * fs.f_bsize;
-}
+    if (GetDiskFreeSpaceExW(u, &navail, NULL, NULL) == 0) {
 
-#elif (NGX_HAVE_STATVFS)
+        if (u != utf16) {
+            ngx_free(u);
+        }
 
-size_t
-ngx_fs_bsize(u_char *name)
-{
-    struct statvfs  fs;
-
-    if (statvfs((char *) name, &fs) == -1) {
-        return 512;
-    }
-
-    if ((fs.f_frsize % 512) != 0) {
-        return 512;
-    }
-
-#if (NGX_LINUX)
-    if ((size_t) fs.f_frsize > ngx_pagesize) {
-        return 512;
-    }
-#endif
-
-    return (size_t) fs.f_frsize;
-}
-
-
-off_t
-ngx_fs_available(u_char *name)
-{
-    struct statvfs  fs;
-
-    if (statvfs((char *) name, &fs) == -1) {
         return NGX_MAX_OFF_T_VALUE;
     }
 
-    return (off_t) fs.f_bavail * fs.f_frsize;
+    if (u != utf16) {
+        ngx_free(u);
+    }
+
+    return (off_t) navail.QuadPart;
 }
 
-#else
 
-size_t
-ngx_fs_bsize(u_char *name)
+static ngx_int_t
+ngx_win32_check_filename(u_short *u, size_t len, ngx_uint_t dirname)
 {
-    return 512;
-}
+    u_long      n;
+    u_short    *lu, *p, *slash, ch;
+    ngx_err_t   err;
+    enum {
+        sw_start = 0,
+        sw_normal,
+        sw_after_slash,
+        sw_after_colon,
+        sw_after_dot
+    } state;
 
+    /* check for NTFS streams (":"), trailing dots and spaces */
 
-off_t
-ngx_fs_available(u_char *name)
-{
-    return NGX_MAX_OFF_T_VALUE;
-}
+    lu = NULL;
+    slash = NULL;
+    state = sw_start;
 
+#if (NGX_SUPPRESS_WARN)
+    ch = 0;
 #endif
+
+    for (p = u; *p; p++) {
+        ch = *p;
+
+        switch (state) {
+
+        case sw_start:
+
+            /*
+             * skip till first "/" to allow paths starting with drive and
+             * relative path, like "c:html/"
+             */
+
+            if (ch == '/' || ch == '\\') {
+                state = sw_after_slash;
+                slash = p;
+            }
+
+            break;
+
+        case sw_normal:
+
+            if (ch == ':') {
+                state = sw_after_colon;
+                break;
+            }
+
+            if (ch == '.' || ch == ' ') {
+                state = sw_after_dot;
+                break;
+            }
+
+            if (ch == '/' || ch == '\\') {
+                state = sw_after_slash;
+                slash = p;
+                break;
+            }
+
+            break;
+
+        case sw_after_slash:
+
+            if (ch == '/' || ch == '\\') {
+                break;
+            }
+
+            if (ch == '.') {
+                break;
+            }
+
+            if (ch == ':') {
+                state = sw_after_colon;
+                break;
+            }
+
+            state = sw_normal;
+            break;
+
+        case sw_after_colon:
+
+            if (ch == '/' || ch == '\\') {
+                state = sw_after_slash;
+                slash = p;
+                break;
+            }
+
+            goto invalid;
+
+        case sw_after_dot:
+
+            if (ch == '/' || ch == '\\') {
+                goto invalid;
+            }
+
+            if (ch == ':') {
+                goto invalid;
+            }
+
+            if (ch == '.' || ch == ' ') {
+                break;
+            }
+
+            state = sw_normal;
+            break;
+        }
+    }
+
+    if (state == sw_after_dot) {
+        goto invalid;
+    }
+
+    if (dirname && slash) {
+        ch = *slash;
+        *slash = '\0';
+        len = slash - u + 1;
+    }
+
+    /* check if long name match */
+
+    lu = malloc(len * 2);
+    if (lu == NULL) {
+        return NGX_ERROR;
+    }
+
+    n = GetLongPathNameW(u, lu, len);
+
+    if (n == 0) {
+
+        if (dirname && slash && ngx_errno == NGX_ENOENT) {
+            ngx_set_errno(NGX_ENOPATH);
+        }
+
+        goto failed;
+    }
+
+    if (n != len - 1 || _wcsicmp(u, lu) != 0) {
+        goto invalid;
+    }
+
+    if (dirname && slash) {
+        *slash = ch;
+    }
+
+    ngx_free(lu);
+
+    return NGX_OK;
+
+invalid:
+
+    ngx_set_errno(NGX_ENOENT);
+
+failed:
+
+    if (dirname && slash) {
+        *slash = ch;
+    }
+
+    if (lu) {
+        err = ngx_errno;
+        ngx_free(lu);
+        ngx_set_errno(err);
+    }
+
+    return NGX_ERROR;
+}
+
+
+static u_short *
+ngx_utf8_to_utf16(u_short *utf16, u_char *utf8, size_t *len, size_t reserved)
+{
+    u_char    *p;
+    u_short   *u, *last;
+    uint32_t   n;
+
+    p = utf8;
+    u = utf16;
+    last = utf16 + *len;
+
+    while (u < last) {
+
+        if (*p < 0x80) {
+            *u++ = (u_short) *p;
+
+            if (*p == 0) {
+                *len = u - utf16;
+                return utf16;
+            }
+
+            p++;
+
+            continue;
+        }
+
+        if (u + 1 == last) {
+            *len = u - utf16;
+            break;
+        }
+
+        n = ngx_utf8_decode(&p, 4);
+
+        if (n > 0x10ffff) {
+            ngx_set_errno(NGX_EILSEQ);
+            return NULL;
+        }
+
+        if (n > 0xffff) {
+            n -= 0x10000;
+            *u++ = (u_short) (0xd800 + (n >> 10));
+            *u++ = (u_short) (0xdc00 + (n & 0x03ff));
+            continue;
+        }
+
+        *u++ = (u_short) n;
+    }
+
+    /* the given buffer is not enough, allocate a new one */
+
+    u = malloc(((p - utf8) + ngx_strlen(p) + 1 + reserved) * sizeof(u_short));
+    if (u == NULL) {
+        return NULL;
+    }
+
+    ngx_memcpy(u, utf16, *len * 2);
+
+    utf16 = u;
+    u += *len;
+
+    for ( ;; ) {
+
+        if (*p < 0x80) {
+            *u++ = (u_short) *p;
+
+            if (*p == 0) {
+                *len = u - utf16;
+                return utf16;
+            }
+
+            p++;
+
+            continue;
+        }
+
+        n = ngx_utf8_decode(&p, 4);
+
+        if (n > 0x10ffff) {
+            ngx_free(utf16);
+            ngx_set_errno(NGX_EILSEQ);
+            return NULL;
+        }
+
+        if (n > 0xffff) {
+            n -= 0x10000;
+            *u++ = (u_short) (0xd800 + (n >> 10));
+            *u++ = (u_short) (0xdc00 + (n & 0x03ff));
+            continue;
+        }
+
+        *u++ = (u_short) n;
+    }
+
+    /* unreachable */
+}
+
+
+static u_char *
+ngx_utf16_to_utf8(u_char *utf8, u_short *utf16, size_t *len, size_t *allocated)
+{
+    u_char    *p, *last;
+    u_short   *u, *j;
+    uint32_t   n;
+
+    u = utf16;
+    p = utf8;
+    last = utf8 + *len;
+
+    while (p < last) {
+
+        if (*u < 0x80) {
+            *p++ = (u_char) *u;
+
+            if (*u == 0) {
+                *len = p - utf8;
+                return utf8;
+            }
+
+            u++;
+
+            continue;
+        }
+
+        if (p >= last - 4) {
+            *len = p - utf8;
+            break;
+        }
+
+        n = ngx_utf16_decode(&u, 2);
+
+        if (n > 0x10ffff) {
+            ngx_set_errno(NGX_EILSEQ);
+            return NULL;
+        }
+
+        if (n >= 0x10000) {
+            *p++ = (u_char) (0xf0 + (n >> 18));
+            *p++ = (u_char) (0x80 + ((n >> 12) & 0x3f));
+            *p++ = (u_char) (0x80 + ((n >> 6) & 0x3f));
+            *p++ = (u_char) (0x80 + (n & 0x3f));
+            continue;
+        }
+
+        if (n >= 0x0800) {
+            *p++ = (u_char) (0xe0 + (n >> 12));
+            *p++ = (u_char) (0x80 + ((n >> 6) & 0x3f));
+            *p++ = (u_char) (0x80 + (n & 0x3f));
+            continue;
+        }
+
+        *p++ = (u_char) (0xc0 + (n >> 6));
+        *p++ = (u_char) (0x80 + (n & 0x3f));
+    }
+
+    /* the given buffer is not enough, allocate a new one */
+
+    for (j = u; *j; j++) { /* void */ }
+
+    p = malloc((j - utf16) * 4 + 1);
+    if (p == NULL) {
+        return NULL;
+    }
+
+    if (allocated) {
+        *allocated = (j - utf16) * 4 + 1;
+    }
+
+    ngx_memcpy(p, utf8, *len);
+
+    utf8 = p;
+    p += *len;
+
+    for ( ;; ) {
+
+        if (*u < 0x80) {
+            *p++ = (u_char) *u;
+
+            if (*u == 0) {
+                *len = p - utf8;
+                return utf8;
+            }
+
+            u++;
+
+            continue;
+        }
+
+        n = ngx_utf16_decode(&u, 2);
+
+        if (n > 0x10ffff) {
+            ngx_free(utf8);
+            ngx_set_errno(NGX_EILSEQ);
+            return NULL;
+        }
+
+        if (n >= 0x10000) {
+            *p++ = (u_char) (0xf0 + (n >> 18));
+            *p++ = (u_char) (0x80 + ((n >> 12) & 0x3f));
+            *p++ = (u_char) (0x80 + ((n >> 6) & 0x3f));
+            *p++ = (u_char) (0x80 + (n & 0x3f));
+            continue;
+        }
+
+        if (n >= 0x0800) {
+            *p++ = (u_char) (0xe0 + (n >> 12));
+            *p++ = (u_char) (0x80 + ((n >> 6) & 0x3f));
+            *p++ = (u_char) (0x80 + (n & 0x3f));
+            continue;
+        }
+
+        *p++ = (u_char) (0xc0 + (n >> 6));
+        *p++ = (u_char) (0x80 + (n & 0x3f));
+    }
+
+    /* unreachable */
+}
+
+
+/*
+ * ngx_utf16_decode() decodes one or two UTF-16 code units
+ * the return values:
+ *    0x80 - 0x10ffff         valid character
+ *    0x110000 - 0xfffffffd   invalid sequence
+ *    0xfffffffe              incomplete sequence
+ *    0xffffffff              error
+ */
+
+uint32_t
+ngx_utf16_decode(u_short **u, size_t n)
+{
+    uint32_t  k, m;
+
+    k = **u;
+
+    if (k < 0xd800 || k > 0xdfff) {
+        (*u)++;
+        return k;
+    }
+
+    if (k > 0xdbff) {
+        (*u)++;
+        return 0xffffffff;
+    }
+
+    if (n < 2) {
+        return 0xfffffffe;
+    }
+
+    (*u)++;
+
+    m = *(*u)++;
+
+    if (m < 0xdc00 || m > 0xdfff) {
+        return 0xffffffff;
+
+    }
+
+    return 0x10000 + ((k - 0xd800) << 10) + (m - 0xdc00);
+}

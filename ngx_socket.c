@@ -9,100 +9,35 @@
 #include <ngx_core.h>
 
 
-/*
- * ioctl(FIONBIO) sets a non-blocking mode with the single syscall
- * while fcntl(F_SETFL, O_NONBLOCK) needs to learn the current state
- * using fcntl(F_GETFL).
- *
- * ioctl() and fcntl() are syscalls at least in FreeBSD 2.x, Linux 2.2
- * and Solaris 7.
- *
- * ioctl() in Linux 2.4 and 2.6 uses BKL, however, fcntl(F_SETFL) uses it too.
- */
-
-
-#if (NGX_HAVE_FIONBIO)
-
 int
 ngx_nonblocking(ngx_socket_t s)
 {
-    int  nb;
+    unsigned long  nb = 1;
 
-    nb = 1;
-
-    return ioctl(s, FIONBIO, &nb);
+    return ioctlsocket(s, FIONBIO, &nb);
 }
 
 
 int
 ngx_blocking(ngx_socket_t s)
 {
-    int  nb;
+    unsigned long  nb = 0;
 
-    nb = 0;
-
-    return ioctl(s, FIONBIO, &nb);
-}
-
-#endif
-
-
-#if (NGX_FREEBSD)
-
-int
-ngx_tcp_nopush(ngx_socket_t s)
-{
-    int  tcp_nopush;
-
-    tcp_nopush = 1;
-
-    return setsockopt(s, IPPROTO_TCP, TCP_NOPUSH,
-                      (const void *) &tcp_nopush, sizeof(int));
+    return ioctlsocket(s, FIONBIO, &nb);
 }
 
 
 int
-ngx_tcp_push(ngx_socket_t s)
+ngx_socket_nread(ngx_socket_t s, int *n)
 {
-    int  tcp_nopush;
+    unsigned long  nread;
 
-    tcp_nopush = 0;
+    if (ioctlsocket(s, FIONREAD, &nread) == -1) {
+        return -1;
+    }
 
-    return setsockopt(s, IPPROTO_TCP, TCP_NOPUSH,
-                      (const void *) &tcp_nopush, sizeof(int));
-}
+    *n = nread;
 
-#elif (NGX_LINUX)
-
-
-int
-ngx_tcp_nopush(ngx_socket_t s)
-{
-    int  cork;
-
-    cork = 1;
-
-    return setsockopt(s, IPPROTO_TCP, TCP_CORK,
-                      (const void *) &cork, sizeof(int));
-}
-
-
-int
-ngx_tcp_push(ngx_socket_t s)
-{
-    int  cork;
-
-    cork = 0;
-
-    return setsockopt(s, IPPROTO_TCP, TCP_CORK,
-                      (const void *) &cork, sizeof(int));
-}
-
-#else
-
-int
-ngx_tcp_nopush(ngx_socket_t s)
-{
     return 0;
 }
 
@@ -112,5 +47,3 @@ ngx_tcp_push(ngx_socket_t s)
 {
     return 0;
 }
-
-#endif

@@ -9,96 +9,75 @@
 #include <ngx_core.h>
 
 
-/*
- * FreeBSD does not test /etc/localtime change, however, we can workaround it
- * by calling tzset() with TZ and then without TZ to update timezone.
- * The trick should work since FreeBSD 2.1.0.
- *
- * Linux does not test /etc/localtime change in localtime(),
- * but may stat("/etc/localtime") several times in every strftime(),
- * therefore we use it to update timezone.
- *
- * Solaris does not test /etc/TIMEZONE change too and no workaround available.
- */
-
 void
-ngx_timezone_update(void)
+ngx_gettimeofday(struct timeval *tp)
 {
-#if (NGX_FREEBSD)
+    uint64_t  intervals;
+    FILETIME  ft;
 
-    if (getenv("TZ")) {
-        return;
-    }
+    GetSystemTimeAsFileTime(&ft);
 
-    putenv("TZ=UTC");
+    /*
+     * A file time is a 64-bit value that represents the number
+     * of 100-nanosecond intervals that have elapsed since
+     * January 1, 1601 12:00 A.M. UTC.
+     *
+     * Between January 1, 1970 (Epoch) and January 1, 1601 there were
+     * 134774 days,
+     * 11644473600 seconds or
+     * 11644473600,000,000,0 100-nanosecond intervals.
+     *
+     * See also MSKB Q167296.
+     */
 
-    tzset();
+    intervals = ((uint64_t) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    intervals -= 116444736000000000;
 
-    unsetenv("TZ");
-
-    tzset();
-
-#elif (NGX_LINUX)
-    time_t      s;
-    struct tm  *t;
-    char        buf[4];
-
-    s = time(0);
-
-    t = localtime(&s);
-
-    strftime(buf, 4, "%H", t);
-
-#endif
-}
-
-
-void
-ngx_localtime(time_t s, ngx_tm_t *tm)
-{
-#if (NGX_HAVE_LOCALTIME_R)
-    (void) localtime_r(&s, tm);
-
-#else
-    ngx_tm_t  *t;
-
-    t = localtime(&s);
-    *tm = *t;
-
-#endif
-
-    tm->ngx_tm_mon++;
-    tm->ngx_tm_year += 1900;
+    tp->tv_sec = (long) (intervals / 10000000);
+    tp->tv_usec = (long) ((intervals % 10000000) / 10);
 }
 
 
 void
 ngx_libc_localtime(time_t s, struct tm *tm)
 {
-#if (NGX_HAVE_LOCALTIME_R)
-    (void) localtime_r(&s, tm);
-
-#else
     struct tm  *t;
 
     t = localtime(&s);
     *tm = *t;
-
-#endif
 }
 
 
 void
 ngx_libc_gmtime(time_t s, struct tm *tm)
 {
-#if (NGX_HAVE_LOCALTIME_R)
-    (void) gmtime_r(&s, tm);
-
-#else
     struct tm  *t;
 
     t = gmtime(&s);
     *tm = *t;
+}
 
-#endif
+
+ngx_int_t
+ngx_gettimezone(void)
+{
+    u_long                 n;
+    TIME_ZONE_INFORMATION  tz;
+
+    n = GetTimeZoneInformation(&tz);
+
+    switch (n) {
+
+    case TIME_ZONE_ID_UNKNOWN:
+        return -tz.Bias;
+
+    case TIME_ZONE_ID_STANDARD:
+        return -(tz.Bias + tz.StandardBias);
+
+    case TIME_ZONE_ID_DAYLIGHT:
+        return -(tz.Bias + tz.DaylightBias);
+
+    default: /* TIME_ZONE_ID_INVALID */
+        return 0;
+    }
 }
