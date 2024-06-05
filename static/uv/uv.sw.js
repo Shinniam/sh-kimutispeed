@@ -156,7 +156,10 @@ class UVServiceWorker extends EventEmitter {
                         break;
                 case 'iframe':
                 case 'document':
-                        if (isHtml(ultraviolet.meta.url, (responseCtx.headers['content-type'] || ''))) {
+                        if (isHtml(ultraviolet.meta.url, (responseCtx.headers['content-type'] || ''))
+                           if (responseCtx.headers["content-type"].includes("text/html")) {
+	responseCtx.headers["content-type"] = "text/html;charset=utf-8";
+}) {
                             responseCtx.body = ultraviolet.rewriteHtml(
                                 await response.text(), 
                                 { 
